@@ -1,5 +1,4 @@
 function animate_move(robot_h, start, goal, dt)
-    % animate robot circle from start to goal in small steps
     steps = max(2, ceil(norm(goal-start)/0.01));
     for s=1:steps
         frac = s/steps;

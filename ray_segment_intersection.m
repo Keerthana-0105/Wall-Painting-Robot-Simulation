@@ -1,6 +1,4 @@
 function [intersect, P] = ray_segment_intersection(p0, d, A, B)
-    % p0 + t*d intersects segment AB?
-    % Solve p0 + t*d = A + u*(B-A), with t>=0, u in [0,1]
     intersect = false; P=[0 0];
     v = B - A;
     M = [d(:), -v(:)];

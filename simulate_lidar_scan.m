@@ -1,17 +1,14 @@
 
 function pts = simulate_lidar_scan(poly, pose, num_beams, max_range, noise_std)
-    % simulate 2D rays and find intersections with polygon edges
-    % pose: [x y]
     angles = linspace(-pi, pi, num_beams);
     rays = [cos(angles(:)), sin(angles(:))];
-    edges = [poly; poly(1,:)]; % repeated for easy indexing
+    edges = [poly; poly(1,:)];
     pts = zeros(num_beams,2);
     for i = 1:num_beams
         p0 = pose(:)';
         dir = rays(i,:);
         min_dist = max_range;
         hit = p0 + dir * max_range;
-        % check each edge
         for e = 1:size(poly,1)
             A = edges(e,:);
             B = edges(e+1,:);
@@ -24,12 +21,10 @@ function pts = simulate_lidar_scan(poly, pose, num_beams, max_range, noise_std)
                 end
             end
         end
-        % add noise to distance
         dnoisy = min_dist + randn()*noise_std;
         dnoisy = max(0, min(dnoisy, max_range));
         pts(i,:) = p0 + dir * dnoisy;
     end
-    % discard points that are at max_range (no hit) to reduce false lines
     valid = vecnorm(pts - pose, 2, 2) < (max_range - 1e-6);
     pts = pts(valid,:);
 end
