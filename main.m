@@ -1,220 +1,117 @@
-clear; close all; clc;
+% wall_painting_slam.m
+% Interactive room drawing -> LIDAR simulation -> RANSAC wall detection ->
+% simple painting path planning & simulation
+%
+% Usage: run the file. Click polygon vertices in the figure window to draw
+% the room boundary. Press Enter/Return when done. The simulation runs
+% automatically and prints number of walls painted.
 
-% --- PARAMETERS ---
-sim.dt = 0.1;
-sim.totalTime = 400;
-robot.wheelRadius = 0.05;
-robot.wheelBase = 0.35;
-robot.maxV = 0.6;
-robot.maxW = 1.2;
-lidar.range = 12.0;           % Increased LIDAR range
-lidar.numScans = 360;
-lidar.noiseStd = 0.01;
-paint.width = 0.6;
-paint.spacing = 0.5;
-mapResolution = 10;
+close all; rng('shuffle');
 
-disp('Draw the room in the top view by clicking on the figure. Press Enter when done.');
-[roomBoundary, occMap, wallSegments] = draw_room(mapResolution);
-
-figure('Name', 'User-defined Room & Layout');
-show(occMap); hold on;
-for i = 1:size(wallSegments, 1)
-    plot([wallSegments(i,1), wallSegments(i,3)], [wallSegments(i,2), wallSegments(i,4)], 'k-', 'LineWidth', 2);
+% ---------- Step 1: User draws room boundary ----------
+figure('Name','Draw room boundary: Click vertices, press Enter when finished',...
+       'NumberTitle','off','Color',[1 1 1]);
+axis equal; hold on; grid on;
+title('Click vertices around the room boundary (clockwise or anticlockwise). Press Enter when done.');
+xlabel('X (m)'); ylabel('Y (m)');
+% Let user click polygon vertices
+[x, y] = get_polygon_from_user();
+poly = [x(:), y(:)];
+if size(poly,1) < 3
+    error('Need at least 3 vertices to form a room.');
 end
-title('Drawn Environment');
+plot([poly(:,1); poly(1,1)], [poly(:,2); poly(1,2)], '-k','LineWidth',2);
+fill(poly(:,1), poly(:,2), [0.95 0.95 1],'FaceAlpha',0.2,'EdgeColor','none');
 
-% --- Start robot pose at the CENTROID of the room, facing right (theta=0) ---
-roomPoly = polyshape(roomBoundary(:,1), roomBoundary(:,2));
-[centerX, centerY] = centroid(roomPoly);
-plot(centerX, centerY, 'rx', 'MarkerSize', 15, 'LineWidth', 2); % Mark room center
-startPoseTrue = [centerX; centerY; 0];
+% ---------- Step 2: Set up simulation parameters ----------
+lidar_range = 10;          % max LIDAR range (m)
+num_beams = 720;          % beams per scan (360 deg)
+lidar_noise_std = 0.005;  % gaussian noise on ranges (m)
+robot_height = 0;         % unused; 2D sim
+% choose scanning poses: center + a grid of interior points for better coverage
+centroid = mean(poly);
+scan_poses = generate_interior_scan_poses(poly, centroid);
 
-slamObj = lidarSLAM(lidar.range, mapResolution);
-slamObj.LoopClosureThreshold = 210;
-slamObj.LoopClosureSearchRadius = 4.0;
-
-truePose = startPoseTrue;
-poseEstimate = truePose;
-trajTrue = truePose.';
-trajEst = poseEstimate.';
-
-planningMap = occMap; % Always use the static map
-
-figure('Name', 'SLAM & Scanning Simulation', 'Units', 'normalized', 'Position', [0.05 0.05 0.9 0.85]);
-hAx = axes; hold on;
-show(occMap, 'Parent', hAx); 
-title('SLAM Map & Robot'); xlabel('X (m)'); ylabel('Y (m)');
-
-paintMap = false(occMap.GridSize);
-
-% -- PHASE 1: Robot scanning the room by rotating in place --
-scanCount = 0; t = 0;
-scanDuration = 10; % seconds
-disp('Robot is scanning the room...');
-while t < scanDuration
-    w = robot.maxW/2;
-    v = 0;
-    dx = v*cos(truePose(3))*sim.dt;
-    dy = v*sin(truePose(3))*sim.dt;
-    dtheta = w * sim.dt;
-    truePose = truePose + [dx; dy; dtheta];
-    scan = simulate_lidar_scan(occMap, truePose, lidar);
-    noisyRanges = scan.Ranges + lidar.noiseStd * randn(size(scan.Ranges));
-    noisyRanges(noisyRanges < 0) = 0;
-    scan = lidarScan(noisyRanges, scan.Angles);
-    scanCount = scanCount + 1;
-    [isUpdated, ~, ~] = slam_update(slamObj, scan);
-    trajTrue = [trajTrue; truePose.'];
-    trajEst = [trajEst; poseEstimate.'];
-    if mod(scanCount, 3) == 0
-        if ~exist('hAx','var') || ~isgraphics(hAx)
-            hAx = gca;
-        end
-        cla(hAx); hold(hAx, 'on');
-        show(occMap, 'Parent', hAx);
-        plot(trajTrue(:,1), trajTrue(:,2), '-b', 'LineWidth', 1, 'Parent', hAx);
-        quiver(truePose(1), truePose(2), cos(truePose(3))*0.3, sin(truePose(3))*0.3, 'k', 'LineWidth', 2, 'MaxHeadSize', 2, 'Parent', hAx);
-        title(hAx, sprintf('Scanning... t=%.1f', t));
-        drawnow;
-    end
-    pause(0.01);
-    t = t + sim.dt;
+% simulate aggregate point cloud from multiple scans
+lidar_points = [];
+for i = 1:size(scan_poses,1)
+    pose = scan_poses(i,:);
+    pts = simulate_lidar_scan(poly, pose, num_beams, lidar_range, lidar_noise_std);
+    lidar_points = [lidar_points; pts]; %#ok<AGROW>
 end
 
-% --- MOVE FROM CENTER TO CLOSEST BOUNDARY POINT ---
-diffs = roomBoundary - repmat([centerX centerY], size(roomBoundary,1), 1);
-dists = sqrt(sum(diffs.^2,2));
-[~, closestIdx] = min(dists);
-targetWallPt = roomBoundary(closestIdx, :);
+% plot raw lidar points
+hpts = plot(lidar_points(:,1), lidar_points(:,2), '.','MarkerSize',6);
+legend('room boundary','lidar points');
 
-disp('Robot moving from center to boundary...');
-reachedWall = false;
-controllerState = [];
-while ~reachedWall
-    % Go to wall point using diffdrive controller
-    localGoal = targetWallPt';
-    [v, w, controllerState] = diffdrive_controller(truePose, localGoal, robot, controllerState);
-    v = max(min(v, robot.maxV), -robot.maxV);
-    w = max(min(w, robot.maxW), -robot.maxW);
-    dx = v*cos(truePose(3))*sim.dt;
-    dy = v*sin(truePose(3))*sim.dt;
-    dtheta = w * sim.dt;
-    truePose = truePose + [dx; dy; dtheta];
-    trajTrue = [trajTrue; truePose.'];
-    if ~exist('hAx','var') || ~isgraphics(hAx)
-        hAx = gca;
+% ---------- Step 3: Detect lines (walls) with simple RANSAC ----------
+max_lines = 20;
+inlier_threshold = 0.02;   % meters
+min_inliers = 40;          % minimum points to accept a line
+[lines, line_inliers] = ransac_lines(lidar_points, max_lines, inlier_threshold, min_inliers);
+
+% plot detected lines
+colors = lines_color_map(length(lines));
+wall_segments = cell(length(lines),1);
+for i = 1:length(lines)
+    L = lines{i}; % [a b c] line ax + by + c = 0 normalized
+    inliers = lidar_points(line_inliers{i},:);
+    % compute endpoints of segment by projecting inliers onto the line and taking min/max
+    proj_coords = project_points_on_line(inliers, L);
+    tmin = min(proj_coords(:,1)); tmax = max(proj_coords(:,1));
+    p1 = [tmin, project_point_from_line_param(L,tmin)];
+    p2 = [tmax, project_point_from_line_param(L,tmax)];
+    % but easier: compute endpoints using 2D line paramization via direction vector
+    dir = [ -L(2), L(1) ]; dir = dir / norm(dir);
+    center_pt = mean(inliers,1);
+    ep1 = center_pt + dir * (tmin - mean(proj_coords(:,1)));
+    ep2 = center_pt + dir * (tmax - mean(proj_coords(:,1)));
+    wall_segments{i} = [ep1; ep2];
+
+    plot([ep1(1) ep2(1)], [ep1(2) ep2(2)], '-','LineWidth',3,'Color',colors(i,:));
+end
+title(sprintf('Detected %d walls (lines).', length(lines)));
+fprintf("Number of walls detected: %d\n", length(lines));
+
+% ---------- Step 4: Create Figure 2 for Robot Boundary Movement ----------
+figure('Name','Robot Moving Along Room Boundary','NumberTitle','off','Color',[1 1 1]);
+axis equal; grid on; hold on;
+xlabel('X (m)'); ylabel('Y (m)');
+title('Robot Following the Room Boundary');
+fill(poly(:,1), poly(:,2), [0.9 0.95 1],'FaceAlpha',0.4,'EdgeColor','b','LineWidth',2);
+plot(poly(:,1), poly(:,2), 'b-', 'LineWidth', 2);
+plot(poly(:,1), poly(:,2), 'bo', 'MarkerFaceColor','b','DisplayName','Boundary Points');
+legend('Room Boundary','Boundary Vertices','Location','bestoutside');
+
+% Robot settings
+robot_radius = 0.03;
+robot_color = [1 0.2 0.2];
+robot_h = plot(poly(1,1), poly(1,2), 'o', 'MarkerFaceColor', robot_color, ...
+               'MarkerEdgeColor','k', 'MarkerSize', 10, 'DisplayName','Robot');
+
+% Animate robot along boundary
+num_vertices = size(poly,1);
+pause(1);
+for i = 1:num_vertices
+    start_pt = poly(i,:);
+    if i < num_vertices
+        end_pt = poly(i+1,:);
+    else
+        end_pt = poly(1,:); % close the loop
     end
-    cla(hAx); hold(hAx, 'on');
-    show(occMap, 'Parent', hAx);
-    plot(trajTrue(:,1), trajTrue(:,2), '-b', 'LineWidth', 1, 'Parent', hAx);
-    quiver(truePose(1), truePose(2), cos(truePose(3))*0.3, sin(truePose(3))*0.3, 'k', 'LineWidth', 2, 'MaxHeadSize', 2, 'Parent', hAx);
-    plot(targetWallPt(1), targetWallPt(2), 'ro', 'MarkerSize', 12, 'LineWidth',2, 'Parent', hAx);
-    title(hAx, 'Moving to Room Boundary...');
+    steps = max(2, ceil(norm(end_pt - start_pt)/0.01));
+    for s = 1:steps
+        frac = s / steps;
+        pos = (1 - frac) * start_pt + frac * end_pt;
+        set(robot_h, 'XData', pos(1), 'YData', pos(2));
+        drawnow limitrate;
+        pause(0.01);
+    end
+    % Mark painted wall visually
+    plot([start_pt(1) end_pt(1)], [start_pt(2) end_pt(2)], '-', ...
+        'LineWidth', 3, 'Color', [0 0.8 0], 'DisplayName','Painted Wall');
     drawnow;
-
-    % Check if robot has reached the wall
-    if norm(truePose(1:2) - targetWallPt') < 0.1
-        reachedWall = true;
-    end
+    fprintf("Painted wall %d (task %d of %d)\n", i, i, num_vertices);
 end
 
-% -- PHASE 2: Robot patrols the interior boundary --
-disp('Robot will patrol the wall interior...');
-wallPath = plan_wall_following(roomBoundary, paint.spacing);
-trajTrue = truePose.';
-
-for i=1:size(wallPath,1)
-    localGoal = wallPath(i,:)';
-    [v, w, controllerState] = diffdrive_controller(truePose, localGoal, robot, []);
-    v = max(min(v, robot.maxV), -robot.maxV);
-    w = max(min(w, robot.maxW), -robot.maxW);
-    dx = v*cos(truePose(3))*sim.dt;
-    dy = v*sin(truePose(3))*sim.dt;
-    dtheta = w * sim.dt;
-    truePose = truePose + [dx; dy; dtheta];
-
-    trajTrue = [trajTrue; truePose.'];
-    paintMap = paint_simulator(paintMap, occMap, truePose, paint);
-
-    if mod(i, 3) == 0
-        if ~exist('hAx','var') || ~isgraphics(hAx)
-            hAx = gca;
-        end
-        cla(hAx); hold(hAx, 'on');
-        paintedIdx = find(paintMap);
-        show(occMap, 'Parent', hAx);
-        if ~isempty(paintedIdx)
-            coords = grid2world(occMap, paintedIdx);
-            scatter(coords(:,1), coords(:,2), 10, 'filled', 'MarkerFaceAlpha', 0.6, 'Parent', hAx);
-        end
-        plot(trajTrue(:,1), trajTrue(:,2), '-b', 'LineWidth', 1, 'Parent', hAx);
-        quiver(truePose(1), truePose(2), cos(truePose(3))*0.3, sin(truePose(3))*0.3, 'k', 'LineWidth', 2, 'MaxHeadSize', 2, 'Parent', hAx);
-        title(hAx, sprintf('Wall Patrol Step %d / %d', i, size(wallPath,1)));
-        drawnow;
-    end
-end
-
-fprintf('Simulation finished. Painted cells: %d\n', sum(paintMap(:)));
-
-
-% --- HELPER FUNCTIONS ---
-
-function [boundary, occMap, wallSegments] = draw_room(mapResolution)
-    figure('Name','Draw the Room Layout');
-    axis([0 5 0 5]); grid on; hold on;
-    title('Click to define the room boundary (clockwise or CCW). Press Enter when done.');
-    [x, y] = getline; % User draws room by clicking
-    boundary = [x, y];
-
-    % Remove all duplicate points (not just consecutive)
-    [~, uniqueIdx] = unique(boundary, 'rows', 'stable');
-    boundary = boundary(uniqueIdx, :);
-
-    % Remove consecutive points that are nearly identical 
-    diffPts = diff(boundary);
-    distPts = sqrt(sum(diffPts.^2,2));
-    boundary = boundary([true; distPts > 1e-3], :);
-
-    % Force closure
-    if norm(boundary(1,:) - boundary(end,:)) > 1e-3
-        boundary = [boundary; boundary(1,:)];
-    end
-
-    wallSegments = [boundary(1:end-1,:) boundary(2:end,:)];    
-    for k = 1:size(wallSegments,1)
-        plot(wallSegments(k,[1,3]), wallSegments(k,[2,4]), 'k-', 'LineWidth', 2);
-    end
-
-    occMap = occupancyMap(5, 5, mapResolution);
-    polyin = polyshape(boundary(:,1), boundary(:,2));
-    [X, Y] = meshgrid(linspace(0,5,5*mapResolution), linspace(0,5,5*mapResolution));
-    in = isinterior(polyin,X(:),Y(:));
-    occMap.setOccupancy([X(:),Y(:)], ~in); 
-end
-
-function wallPath = plan_wall_following(boundary, spacing)
-    offset = 0.1; % Offset inward for wall following path
-    wallPath = [];
-    for i = 1:(size(boundary,1)-1)
-        p1 = boundary(i,:);
-        p2 = boundary(i+1,:);
-        dp = p2 - p1;
-        L = norm(dp);
-        nPts = ceil(L / spacing);
-        for k = 0:nPts
-            pt = p1 + k/nPts*dp;
-            % Compute inward normal
-            normal = dp / L;
-            normal = [-normal(2), normal(1)]; % 90 deg CCW rotation
-            pt_in = pt + offset * normal;
-            wallPath = [wallPath; pt_in];
-        end
-    end
-end
-
-% --- You should have these helper functions implemented in your path: ---
-% - diffdrive_controller
-% - simulate_lidar_scan
-% - paint_simulator
-% - slam_update
+fprintf("Painting finished. Total walls painted: %d\n", num_vertices);

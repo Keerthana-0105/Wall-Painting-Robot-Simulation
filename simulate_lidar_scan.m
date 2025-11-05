@@ -1,36 +1,35 @@
-function scan = simulate_lidar_scan(occMap, pose, lidar)
-% simulate_lidar_scan Simulate a 2D lidar scan from occupancyMap at given pose.
-% pose = [x;y;theta]
-% lidar fields: range, numScans
 
-angles = linspace(-pi, pi, lidar.numScans)';
-ranges = lidar.range * ones(size(angles));
-occMatrix = occupancyMatrix(occMap);  % get the occupancy grid matrix
-
-for i=1:length(angles)
-    a = angles(i) + pose(3);
-    t = linspace(0, lidar.range, 200);
-    xs = pose(1) + t*cos(a);
-    ys = pose(2) + t*sin(a);
-    indices = world2grid(occMap, [xs' ys']);
-    ix = round(indices(:,1));
-    iy = round(indices(:,2));
-    valid = ix>=1 & iy>=1 & ix<=occMap.GridSize(2) & iy<=occMap.GridSize(1);
-    hitIdx = [];
-    for k=1:length(t)
-        if ~valid(k), break; end
-        if occMatrix(iy(k), ix(k)) > 0.5
-            hitIdx = k;
-            break;
+function pts = simulate_lidar_scan(poly, pose, num_beams, max_range, noise_std)
+    % simulate 2D rays and find intersections with polygon edges
+    % pose: [x y]
+    angles = linspace(-pi, pi, num_beams);
+    rays = [cos(angles(:)), sin(angles(:))];
+    edges = [poly; poly(1,:)]; % repeated for easy indexing
+    pts = zeros(num_beams,2);
+    for i = 1:num_beams
+        p0 = pose(:)';
+        dir = rays(i,:);
+        min_dist = max_range;
+        hit = p0 + dir * max_range;
+        % check each edge
+        for e = 1:size(poly,1)
+            A = edges(e,:);
+            B = edges(e+1,:);
+            [intersect, P] = ray_segment_intersection(p0, dir, A, B);
+            if intersect
+                d = norm(P - p0);
+                if d < min_dist
+                    min_dist = d;
+                    hit = P;
+                end
+            end
         end
+        % add noise to distance
+        dnoisy = min_dist + randn()*noise_std;
+        dnoisy = max(0, min(dnoisy, max_range));
+        pts(i,:) = p0 + dir * dnoisy;
     end
-    if ~isempty(hitIdx)
-        ranges(i) = t(hitIdx);
-    else
-        ranges(i) = lidar.range;
-    end
-end
-
-scan = lidarScan(ranges, angles);
-
+    % discard points that are at max_range (no hit) to reduce false lines
+    valid = vecnorm(pts - pose, 2, 2) < (max_range - 1e-6);
+    pts = pts(valid,:);
 end
